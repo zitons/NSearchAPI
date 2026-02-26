@@ -1,39 +1,155 @@
-# ... (前面的 import 保持不变)
+import os
+import json
+import asyncio
+import aiohttp
+import logging
+import re
+import requests
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import JSONResponse
+from bs4 import BeautifulSoup
+from typing import List, Dict, Any
+
+app = FastAPI()
+
+# 配置日志：确保在 Vercel Logs 中能看到输出
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Vercel 环境下只有 /tmp 是可写的
+CACHE_DIR = "/tmp/cache/"
+if not os.path.exists(CACHE_DIR):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
+def extract_text(text: str, limit=1000) -> str:
+    """提取纯文本并限制长度"""
+    token_pattern = re.compile(r'[A-Za-z]+|[\u4e00-\u9fff]|.', re.UNICODE)
+    tokens = token_pattern.findall(text)
+    return ''.join(tokens[:limit])
 
 def get_search_results_sync(keyword: str, pages: int = 1) -> List[Dict[str, Any]]:
     results = []
-    # 进一步模拟真实浏览器，增加随机性
+    # 模拟高权重浏览器 Header
     headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,webp,video/webm,*/*;q=0.8",
         "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
         "Referer": "https://www.bing.com/",
-        "DNT": "1",
-        "Connection": "keep-alive"
+        "Cache-Control": "max-age=0",
+        "Upgrade-Insecure-Requests": "1"
     }
 
     for i in range(pages):
         first = i * 10 + 1
-        # 强制使用英文版或者中文版参数，有时能绕过拦截
-        url = f"https://www.bing.com/search?q={keyword}&first={first}&FORM=PERE"
-        logging.info(f"[DEBUG] 正在尝试 URL: {url}")
+        url = f"https://www.bing.com/search?q={keyword}&first={first}"
+        logging.info(f"[DEBUG] 正在尝试请求 URL: {url}")
         
         try:
-            # 增加 Session 保持
+            # 使用 Session 模拟真实访问
             with requests.Session() as s:
                 response = s.get(url, headers=headers, timeout=10)
-                html_snippet = response.text[:500].replace('\n', '')
-                logging.info(f"[DEBUG] 页面前500字符: {html_snippet}")
+                logging.info(f"[DEBUG] HTTP 响应码: {response.status_code}")
                 
-                if "验证" in response.text or "Captcha" in response.text:
-                    logging.error("[!] 触发了验证码，IP 可能被风控了")
-                    return []
+                # 打印前 1000 字符用于排查是否被拦截
+                snippet = response.text[:1000].replace('\n', ' ')
+                logging.info(f"[DEBUG] 页面源码片段: {snippet}")
 
-                soup = BeautifulSoup(response.text, "html.parser") # 换回 html.parser 兼容性更好
+                if "Ref A:" in response.text or "验证" in response.text:
+                    logging.error("[!] 探测到拦截页面或验证码，IP 可能已被风控")
+                    continue
+
+                soup = BeautifulSoup(response.text, "html.parser")
                 
-                # 方案 A: 经典 b_algo
+                # 方案 A: 寻找标准结果块
                 items = soup.find_all("li", class_="b_algo")
+                logging.info(f"[DEBUG] 方案 A (b_algo) 找到条目: {len(items)}")
                 
+                # 方案 B: 备选通用选择器
+                if not items:
+                    logging.info("[DEBUG] 方案 A 失败，尝试方案 B (CSS Selector)")
+                    items = soup.select("#b_results .b_algo, #b_results h2 a")
+                    logging.info(f"[DEBUG] 方案 B 找到条目: {len(items)}")
+
+                for item in items:
+                    try:
+                        # 容错解析：可能是 a 标签也可能是包含 a 的块
+                        if item.name == 'a':
+                            a_tag = item
+                            parent = item.find_parent("li") or item
+                        else:
+                            a_tag = item.find("a", href=True)
+                            parent = item
+                        
+                        if not a_tag: continue
+                        
+                        link = a_tag.get("href", "")
+                        # 过滤掉广告链接和 Bing 内部链接
+                        if link.startswith("http") and "bing.com" not in link:
+                            results.append({
+                                "title": a_tag.get_text(strip=True),
+                                "link": link,
+                                "description": parent.get_text(strip=True)[:150]
+                            })
+                    except Exception as e:
+                        logging.debug(f"单条结果解析失败: {e}")
+                        continue
+
+        except Exception as e:
+            logging.error(f"[ERROR] 搜索请求发生崩溃: {str(e)}")
+            
+    # 去重
+    seen_links = set()
+    unique_results = []
+    for res in results:
+        if res['link'] not in seen_links:
+            seen_links.add(res['link'])
+            unique_results.append(res)
+            
+    return unique_results
+
+async def fetch_content(session: aiohttp.ClientSession, url: str) -> str:
+    """异步抓取目标网页内容"""
+    try:
+        async with session.get(url, timeout=5) as response:
+            if response.status != 200:
+                return f"HTTP {response.status}"
+            html = await response.text()
+            soup = BeautifulSoup(html, "html.parser")
+            # 移除脚本和样式
+            for script in soup(["script", "style"]):
+                script.decompose()
+            text = soup.get_text(separator=' ', strip=True)
+            return extract_text(text, limit=600)
+    except Exception as e:
+        return f"爬取失败: {str(e)}"
+
+@app.get("/nsearch")
+async def nsearch(s: str = Query(..., description="搜索关键词"), pages: int = 1):
+    logging.info(f"=== [收到新请求] 关键词: {s} ===")
+    
+    # 1. 获取搜索列表
+    search_results = await asyncio.to_thread(get_search_results_sync, s, pages)
+    
+    if not search_results:
+        return JSONResponse(content={
+            "status": "empty",
+            "message": "未找到结果，请查看 Vercel Logs 中的源码片段排查拦截情况",
+            "results": []
+        })
+
+    # 2. 异步爬取具体内容
+    async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
+        tasks = [fetch_content(session, r["link"]) for r in search_results]
+        contents = await asyncio.gather(*tasks)
+    
+    for idx, content in enumerate(contents):
+        if idx < len(search_results):
+            search_results[idx]["content"] = content
+            
+    return JSONResponse(content=search_results)
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "NSearch-Vercel"}
                 # 方案 B: 如果 A 失败，寻找所有带链接的 H2
                 if not items:
                     logging.info("[DEBUG] 方案 A 失败，启动方案 B (CSS Selector)")

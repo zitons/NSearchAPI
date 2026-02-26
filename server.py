@@ -11,9 +11,10 @@ from bs4 import BeautifulSoup
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 
-# Vercel 唯一可写的临时目录
+# Vercel 环境下只有 /tmp 是可写的
 CACHE_DIR = "/tmp/cache/"
-os.makedirs(CACHE_DIR, exist_ok=True)
+if not os.path.exists(CACHE_DIR):
+    os.makedirs(CACHE_DIR, exist_ok=True)
 
 def extract_text(text: str, limit: int = 1000) -> str:
     tokens = re.findall(r'[A-Za-z]+|[\u4e00-\u9fff]|.', text)
@@ -34,6 +35,77 @@ def get_search_results_sync(keyword: str, pages: int = 1) -> list:
         url = f"https://www.bing.com/search?q={keyword}&first={first}"
         try:
             with requests.Session() as s:
+                # 严格对齐 16 个空格 (4层缩进)
+                s.cookies.set("SRCHHPGUSR", "ULSR=1", domain=".bing.com")
+                res = s.get(url, headers=headers, timeout=10)
+                soup = BeautifulSoup(res.text, "html.parser")
+                
+                items = soup.find_all("li", class_="b_algo")
+                if not items:
+                    items = soup.select("#b_results .b_algo, #b_results h2 a")
+                    
+                for item in items:
+                    a_tag = item if item.name == 'a' else item.find("a", href=True)
+                    if not a_tag:
+                        continue
+                    link = a_tag.get("href", "")
+                    if link.startswith("http") and "bing.com" not in link:
+                        results.append({
+                            "title": a_tag.get_text(strip=True),
+                            "link": link,
+                            "description": item.get_text(strip=True)[:150]
+                        })
+        except Exception as e:
+            logging.error(f"Error fetching page {i}: {e}")
+            
+    return results
+
+async def fetch_content(session: aiohttp.ClientSession, url: str) -> str:
+    try:
+        async with session.get(url, timeout=5) as response:
+            if response.status == 200:
+                html = await response.text()
+                soup = BeautifulSoup(html, "html.parser")
+                for script in soup(["script", "style"]):
+                    script.decompose()
+                return extract_text(soup.get_text(separator=' ', strip=True), 600)
+            return f"HTTP {response.status}"
+    except Exception as e:
+        return f"Fetch Error: {str(e)}"
+
+@app.get("/nsearch")
+async def nsearch(s: str = Query(...), pages: int = 1):
+    search_results = await asyncio.to_thread(get_search_results_sync, s, pages)
+    
+    # 侦察模式：如果结果为空，返回原始 HTML 片段
+    if not search_results:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        url = f"https://www.bing.com/search?q={s}&first=1"
+        try:
+            res = requests.get(url, headers=headers, timeout=10)
+            raw_html = res.text[:1500]
+        except:
+            raw_html = "Request failed"
+            
+        return JSONResponse(content={
+            "status": "empty",
+            "debug_html": raw_html,
+            "results": []
+        })
+        
+    async with aiohttp.ClientSession() as session:
+        tasks = [fetch_content(session, r["link"]) for r in search_results]
+        contents = await asyncio.gather(*tasks)
+        
+    for idx, content in enumerate(contents):
+        if idx < len(search_results):
+            search_results[idx]["content"] = content
+            
+    return JSONResponse(content=search_results)
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "msg": "NSearch API is running"}
                 s.cookies.set("SRCHHPGUSR", "ULSR=1", domain=".bing.com")
                 res = s.get(url, headers=headers, timeout=10)
                 soup = BeautifulSoup(res.text, "html.parser")

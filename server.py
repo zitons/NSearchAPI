@@ -12,15 +12,16 @@ from typing import List, Dict, Any
 
 app = FastAPI()
 
-# 配置日志
+# 配置日志：确保在 Vercel 控制台能看到实时输出
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Vercel 临时目录
+# Vercel 环境下只有 /tmp 是可写的
 CACHE_DIR = "/tmp/cache/"
 if not os.path.exists(CACHE_DIR):
     os.makedirs(CACHE_DIR, exist_ok=True)
 
 def extract_text(text: str, limit=1000) -> str:
+    """提取纯文本并限制长度"""
     token_pattern = re.compile(r'[A-Za-z]+|[\u4e00-\u9fff]|.', re.UNICODE)
     tokens = token_pattern.findall(text)
     return ''.join(tokens[:limit])
@@ -30,10 +31,109 @@ def get_search_results_sync(keyword: str, pages: int = 1) -> List[Dict[str, Any]
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,webp,*/*;q=0.8",
-        "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         "Referer": "https://www.bing.com/"
     }
 
+    for i in range(pages):
+        first = i * 10 + 1
+        url = f"https://www.bing.com/search?q={keyword}&first={first}"
+        logging.info(f"[DEBUG] 正在尝试请求: {url}")
+        
+        try:
+            with requests.Session() as s:
+                response = s.get(url, headers=headers, timeout=10)
+                logging.info(f"[DEBUG] HTTP 状态码: {response.status_code}")
+                
+                # 检查是否被拦截 (Ref A 是 Bing 拦截的典型特征)
+                if "Ref A:" in response.text or "验证" in response.text:
+                    logging.error("[!] 触发拦截页面，跳过此页")
+                    continue
+
+                soup = BeautifulSoup(response.text, "html.parser")
+                
+                # 方案 A: 寻找标准结果块
+                items = soup.find_all("li", class_="b_algo")
+                logging.info(f"[DEBUG] 方案 A 找到条目: {len(items)}")
+                
+                # 方案 B: 备选通用选择器（修正了之前的缩进问题）
+                if not items:
+                    logging.info("[DEBUG] 方案 A 失败，尝试方案 B (CSS Selector)")
+                    items = soup.select("#b_results .b_algo, #b_results h2 a")
+                    logging.info(f"[DEBUG] 方案 B 找到条目: {len(items)}")
+
+                for item in items:
+                    try:
+                        if item.name == 'a':
+                            a_tag = item
+                            parent = item.find_parent("li") or item
+                        else:
+                            a_tag = item.find("a", href=True)
+                            parent = item
+                        
+                        if not a_tag: continue
+                        
+                        link = a_tag.get("href", "")
+                        if link.startswith("http") and "bing.com" not in link:
+                            results.append({
+                                "title": a_tag.get_text(strip=True),
+                                "link": link,
+                                "description": parent.get_text(strip=True)[:150]
+                            })
+                    except Exception:
+                        continue
+        except Exception as e:
+            logging.error(f"[ERROR] 抓取崩溃: {str(e)}")
+            
+    # 去重逻辑
+    seen = set()
+    unique_results = []
+    for res in results:
+        if res['link'] not in seen:
+            seen.add(res['link'])
+            unique_results.append(res)
+            
+    return unique_results
+
+async def fetch_content(session: aiohttp.ClientSession, url: str) -> str:
+    """异步抓取目标网页内容"""
+    try:
+        async with session.get(url, timeout=5) as response:
+            if response.status != 200: return f"HTTP {response.status}"
+            html = await response.text()
+            soup = BeautifulSoup(html, "html.parser")
+            # 移除干扰元素
+            for script in soup(["script", "style"]):
+                script.decompose()
+            text = soup.get_text(separator=' ', strip=True)
+            return extract_text(text, limit=600)
+    except Exception as e:
+        return f"爬取失败: {str(e)}"
+
+@app.get("/nsearch")
+async def nsearch(s: str = Query(..., description="搜索关键词"), pages: int = 1):
+    logging.info(f"=== [收到新请求] 关键词: {s} ===")
+    
+    # 获取搜索列表 (在线程池中运行同步请求)
+    search_results = await asyncio.to_thread(get_search_results_sync, s, pages)
+    
+    if not search_results:
+        return JSONResponse(content={"status": "empty", "results": []})
+
+    # 并发爬取内容
+    async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
+        tasks = [fetch_content(session, r["link"]) for r in search_results]
+        contents = await asyncio.gather(*tasks)
+    
+    for idx, content in enumerate(contents):
+        if idx < len(search_results):
+            search_results[idx]["content"] = content
+            
+    return JSONResponse(content=search_results)
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "NSearch-Vercel"}
     for i in range(pages):
         first = i * 10 + 1
         url = f"https://www.bing.com/search?q={keyword}&first={first}"

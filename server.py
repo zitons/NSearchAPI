@@ -11,8 +11,11 @@ from bs4 import BeautifulSoup
 from typing import List, Dict, Any
 
 app = FastAPI()
+
+# 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# Vercel 临时目录
 CACHE_DIR = "/tmp/cache/"
 if not os.path.exists(CACHE_DIR):
     os.makedirs(CACHE_DIR, exist_ok=True)
@@ -24,16 +27,103 @@ def extract_text(text: str, limit=1000) -> str:
 
 def get_search_results_sync(keyword: str, pages: int = 1) -> List[Dict[str, Any]]:
     results = []
-    # [span_3](start_span)参考了 Kotlin 代码中的请求头逻辑[span_3](end_span)
+    # 参考 Kotlin 版 headers 优化
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         "Connection": "keep-alive",
-        "Referer": "https://www.bing.com/"
+        "Referer": "https://www.bing.com/",
+        "Cache-Control": "max-age=0"
     }
 
     for i in range(pages):
+        first = i * 10 + 1
+        url = f"https://www.bing.com/search?q={keyword}&first={first}"
+        logging.info(f"[DEBUG] 请求 URL: {url}")
+        
+        try:
+            with requests.Session() as s:
+                # 注入 Kotlin 版提到的关键 Cookie
+                s.cookies.set("SRCHHPGUSR", "ULSR=1", domain=".bing.com")
+                response = s.get(url, headers=headers, timeout=10)
+                
+                if "Ref A:" in response.text or "验证" in response.text:
+                    logging.error("[!] 触发拦截页面")
+                    continue
+
+                soup = BeautifulSoup(response.text, "html.parser")
+                
+                # 方案 A: 经典 li.b_algo
+                items = soup.find_all("li", class_="b_algo")
+                
+                # 方案 B: 通用 H2 A 选择器
+                if not items:
+                    logging.info("[DEBUG] 备选解析方案启动")
+                    items = soup.select("#b_results .b_algo, #b_results h2 a")
+
+                for item in items:
+                    try:
+                        # 兼容性解析标题与链接
+                        a_tag = item if item.name == 'a' else item.find("a", href=True)
+                        if not a_tag: continue
+                        
+                        link = a_tag.get("href", "")
+                        if link.startswith("http") and "bing.com" not in link:
+                            results.append({
+                                "title": a_tag.get_text(strip=True),
+                                "link": link,
+                                "description": item.get_text(strip=True)[:150]
+                            })
+                    except Exception:
+                        continue
+        except Exception as e:
+            logging.error(f"[ERROR] 循环报错: {str(e)}")
+            
+    # 去重
+    seen_links = set()
+    unique_results = []
+    for res in results:
+        if res['link'] not in seen_links:
+            seen_links.add(res['link'])
+            unique_results.append(res)
+            
+    return unique_results
+
+async def fetch_content(session: aiohttp.ClientSession, url: str) -> str:
+    try:
+        async with session.get(url, timeout=5) as response:
+            if response.status != 200: return f"HTTP {response.status}"
+            html = await response.text()
+            soup = BeautifulSoup(html, "html.parser")
+            for script in soup(["script", "style"]):
+                script.decompose()
+            text = soup.get_text(separator=' ', strip=True)
+            return extract_text(text, limit=600)
+    except Exception as e:
+        return f"爬取失败: {str(e)}"
+
+@app.get("/nsearch")
+async def nsearch(s: str = Query(..., description="Query"), pages: int = 1):
+    logging.info(f"=== 新搜索请求: {s} ===")
+    search_results = await asyncio.to_thread(get_search_results_sync, s, pages)
+    
+    if not search_results:
+        return JSONResponse(content={"status": "empty", "results": []})
+
+    async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
+        tasks = [fetch_content(session, r["link"]) for r in search_results]
+        contents = await asyncio.gather(*tasks)
+    
+    for idx, content in enumerate(contents):
+        if idx < len(search_results):
+            search_results[idx]["content"] = content
+            
+    return JSONResponse(content=search_results)
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "NSearch-Vercel"}
         first = i * 10 + 1
         url = f"https://www.bing.com/search?q={keyword}&first={first}"
         logging.info(f"[DEBUG] Fetching: {url}")

@@ -1,39 +1,73 @@
-import os
-import json
-import asyncio
-import aiohttp
-import logging
-import re
-import requests
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse
-from bs4 import BeautifulSoup
-from typing import List, Dict, Any
-
-app = FastAPI()
-# 设置日志级别为 INFO
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-CACHE_DIR = "/tmp/cache/"
-if not os.path.exists(CACHE_DIR):
-    os.makedirs(CACHE_DIR, exist_ok=True)
-
-def extract_text(text: str, limit=1000) -> str:
-    token_pattern = re.compile(r'[A-Za-z]+|[\u4e00-\u9fff]|.', re.UNICODE)
-    tokens = token_pattern.findall(text)
-    return ''.join(tokens[:limit])
+# ... (前面的 import 保持不变)
 
 def get_search_results_sync(keyword: str, pages: int = 1) -> List[Dict[str, Any]]:
     results = []
+    # 进一步模拟真实浏览器，增加随机性
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,webp,*/*;q=0.8",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "Referer": "https://www.bing.com/"
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,webp,video/webm,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": "https://www.bing.com/",
+        "DNT": "1",
+        "Connection": "keep-alive"
     }
 
     for i in range(pages):
-        first = 1 + i * 10
+        first = i * 10 + 1
+        # 强制使用英文版或者中文版参数，有时能绕过拦截
+        url = f"https://www.bing.com/search?q={keyword}&first={first}&FORM=PERE"
+        logging.info(f"[DEBUG] 正在尝试 URL: {url}")
+        
+        try:
+            # 增加 Session 保持
+            with requests.Session() as s:
+                response = s.get(url, headers=headers, timeout=10)
+                html_snippet = response.text[:500].replace('\n', '')
+                logging.info(f"[DEBUG] 页面前500字符: {html_snippet}")
+                
+                if "验证" in response.text or "Captcha" in response.text:
+                    logging.error("[!] 触发了验证码，IP 可能被风控了")
+                    return []
+
+                soup = BeautifulSoup(response.text, "html.parser") # 换回 html.parser 兼容性更好
+                
+                # 方案 A: 经典 b_algo
+                items = soup.find_all("li", class_="b_algo")
+                
+                # 方案 B: 如果 A 失败，寻找所有带链接的 H2
+                if not items:
+                    logging.info("[DEBUG] 方案 A 失败，启动方案 B (CSS Selector)")
+                    # 匹配任何在搜索结果区域的标题链接
+                    items = soup.select("#b_results .b_algo, #b_results h2 a")
+
+                for item in items:
+                    # 这里的解析逻辑要更具容错性
+                    try:
+                        if item.name == 'a':
+                            a_tag = item
+                            parent = item.find_parent("li") or item
+                        else:
+                            a_tag = item.find("a", href=True)
+                            parent = item
+                        
+                        link = a_tag.get("href", "")
+                        if link.startswith("http") and "bing.com" not in link:
+                            results.append({
+                                "title": a_tag.get_text(strip=True),
+                                "link": link,
+                                "description": parent.get_text(strip=True)[:100]
+                            })
+                    except:
+                        continue
+
+        except Exception as e:
+            logging.error(f"[ERROR] 请求失败: {str(e)}")
+            
+    # 去重处理
+    unique_results = {res['link']: res for res in results}.values()
+    return list(unique_results)
+
+# ... (剩下的 /nsearch 路由逻辑保持不变)
         url = f"https://www.bing.com/search?q={keyword}&first={first}"
         logging.info(f"--- [DEBUG] 正在请求第 {i+1} 页: {url} ---")
         

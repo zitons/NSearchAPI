@@ -11,29 +11,102 @@ from bs4 import BeautifulSoup
 from typing import List, Dict, Any
 
 app = FastAPI()
-
-# 配置日志：确保在 Vercel 控制台能看到实时输出
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Vercel 环境下只有 /tmp 是可写的
 CACHE_DIR = "/tmp/cache/"
 if not os.path.exists(CACHE_DIR):
     os.makedirs(CACHE_DIR, exist_ok=True)
 
 def extract_text(text: str, limit=1000) -> str:
-    """提取纯文本并限制长度"""
     token_pattern = re.compile(r'[A-Za-z]+|[\u4e00-\u9fff]|.', re.UNICODE)
     tokens = token_pattern.findall(text)
     return ''.join(tokens[:limit])
 
 def get_search_results_sync(keyword: str, pages: int = 1) -> List[Dict[str, Any]]:
     results = []
+    # [span_3](start_span)参考了 Kotlin 代码中的请求头逻辑[span_3](end_span)
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,webp,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Connection": "keep-alive",
         "Referer": "https://www.bing.com/"
     }
+
+    for i in range(pages):
+        first = i * 10 + 1
+        url = f"https://www.bing.com/search?q={keyword}&first={first}"
+        logging.info(f"[DEBUG] Fetching: {url}")
+        
+        try:
+            with requests.Session() as s:
+                # [span_4](start_span)注入类似 Kotlin 版的 Cookie 伪装[span_4](end_span)
+                s.cookies.set("SRCHHPGUSR", "ULSR=1", domain=".bing.com")
+                response = s.get(url, headers=headers, timeout=10)
+                
+                if "Ref A:" in response.text or "验证" in response.text:
+                    logging.error("[!] IP 被拦截")
+                    continue
+
+                soup = BeautifulSoup(response.text, "html.parser")
+                # [span_5](start_span)使用 Kotlin 代码中提到的 li.b_algo 解析器[span_5](end_span)
+                items = soup.find_all("li", class_="b_algo")
+                
+                # 这里的 if 层级我已严格对齐
+                if not items:
+                    logging.info("[DEBUG] 方案 A 失败，尝试通用选择器")
+                    items = soup.select("#b_results .b_algo, #b_results h2 a")
+
+                for item in items:
+                    try:
+                        # [span_6](start_span)提取标题和链接，参考 Kotlin 的 select 逻辑[span_6](end_span)
+                        a_tag = item if item.name == 'a' else item.find("a", href=True)
+                        if not a_tag: continue
+                        
+                        link = a_tag.get("href", "")
+                        if link.startswith("http") and "bing.com" not in link:
+                            results.append({
+                                "title": a_tag.get_text(strip=True),
+                                "link": link,
+                                "description": item.get_text(strip=True)[:100]
+                            })
+                    except:
+                        continue
+        except Exception as e:
+            logging.error(f"[ERROR] {str(e)}")
+            
+    return results
+
+@app.get("/nsearch")
+async def nsearch(s: str = Query(..., description="Query"), pages: int = 1):
+    logging.info(f"=== New Search: {s} ===")
+    search_results = await asyncio.to_thread(get_search_results_sync, s, pages)
+    
+    if not search_results:
+        return JSONResponse(content={"status": "empty", "results": []})
+
+    async with aiohttp.ClientSession() as session:
+        tasks = [fetch_content(session, r["link"]) for r in search_results]
+        contents = await asyncio.gather(*tasks)
+    
+    for idx, content in enumerate(contents):
+        if idx < len(search_results):
+            search_results[idx]["content"] = content
+            
+    return JSONResponse(content=search_results)
+
+async def fetch_content(session: aiohttp.ClientSession, url: str) -> str:
+    try:
+        async with session.get(url, timeout=5) as response:
+            if response.status != 200: return f"Error {response.status}"
+            soup = BeautifulSoup(await response.text(), "html.parser")
+            return extract_text(soup.get_text(separator=' ', strip=True), limit=500)
+    except:
+        return "爬取失败"
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "msg": "NSearch Ready"}
 
     for i in range(pages):
         first = i * 10 + 1
